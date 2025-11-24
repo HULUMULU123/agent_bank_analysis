@@ -4,3 +4,6 @@ scikit-learn
 pyod
 networkx
 openpyxl
+langchain_core
+langchain_gigachat
+tqdm

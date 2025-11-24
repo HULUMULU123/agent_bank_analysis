@@ -1,12 +1,13 @@
-"""Individual behavior analysis tool using IsolationForest."""
+"""Individual behavior analysis tool using IsolationForest (per-INN)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 
 @dataclass
@@ -15,14 +16,91 @@ class IndividualBehaviorResult:
 
 
 class IndividualBehaviorTool:
-    """Run per-entity IsolationForest models for debit and credit roles."""
+    """
+    Индивидуальные поведенческие аномалии по ИНН.
 
-    def __init__(self, random_state: int = 42, contamination: float = 0.05) -> None:
+    Логика приближена к ноутбуку:
+    - отдельная модель IsolationForest для КАЖДОГО ИНН и КАЖДОЙ роли (debit/credit);
+    - набор расширенных фич (amount, roll_* , spikes, текст и т.п. — в пределах того,
+      что есть в debit_table/credit_table от FeatureEngineer._split_roles);
+    - адаптивный contamination по количеству транзакций по ИНН;
+    - нормировка score внутри ИНН в [0, 1];
+    - для транзакции общий behavior_score = max(iforest_score_debit, iforest_score_credit).
+    """
+
+    def __init__(
+        self,
+        random_state: int = 42,
+        min_tx_per_inn: int = 10,
+        min_contamination: float = 0.02,
+        max_contamination: float = 0.20,
+    ) -> None:
         self.random_state = random_state
-        self.contamination = contamination
+        self.min_tx_per_inn = min_tx_per_inn
+        self.min_contamination = min_contamination
+        self.max_contamination = max_contamination
 
-    def _fit_side(self, table: pd.DataFrame) -> pd.Series:
+    # ----------------------- ВСПОМОГАТЕЛЬНОЕ -----------------------
+
+    def _adaptive_contamination(
+        self,
+        n_samples: int,
+        min_anom: int = 3,
+        max_anom: int = 10,
+    ) -> float:
+        """
+        Адаптивный уровень contamination:
+        - хотим 3–10 аномалий на ИНН,
+        - но в пределах [min_contamination, max_contamination].
+        """
+        if n_samples <= 0:
+            return self.min_contamination
+
+        target = max(min_anom / n_samples, self.min_contamination)
+        target = min(target, max_anom / n_samples)
+        return float(np.clip(target, self.min_contamination, self.max_contamination))
+
+    def _prepare_side_features(self, table: pd.DataFrame) -> pd.DataFrame:
+        """
+        Приводим таблицу роли (debit/credit) к формату, близкому к ноутбуку:
+        - добавляем log_days_since_last;
+        - считаем rel_amount_to_mean30d;
+        - заполняем отсутствующие фичи нулями.
+        Ожидается, что table получен из FeatureEngineer._split_roles.
+        """
+        tbl = table.copy()
+
+        # базовые колонки из FeatureEngineer._split_roles
+        # (txn_id, date, inn, side, purpose, amount, log_amount, …)
+        if "amount" not in tbl.columns:
+            # на всякий случай восстанавливаем из log_amount, если нужно
+            if "log_amount" in tbl.columns:
+                tbl["amount"] = np.expm1(tbl["log_amount"]).clip(lower=0)
+            else:
+                tbl["amount"] = 0.0
+
+        # лог-интервал между операциями
+        if "days_since_last_txn" in tbl.columns:
+            tbl["log_days_since_last"] = np.log1p(
+                tbl["days_since_last_txn"].astype(float)
+            )
+        else:
+            tbl["log_days_since_last"] = 0.0
+
+        # относительная сумма к среднему за 30 дней
+        if "roll_mean_30d" in tbl.columns:
+            rel = tbl["amount"].astype(float) / (
+                tbl["roll_mean_30d"].replace(0, np.nan) + 1e-6
+            )
+            tbl["rel_amount_to_mean30d"] = (
+                rel.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            )
+        else:
+            tbl["rel_amount_to_mean30d"] = 0.0
+
+        # фичи, максимально приближённые к ноутбуку, но из того, что реально есть
         feature_cols = [
+            "amount",
             "log_amount",
             "roll_cnt_30d",
             "roll_mean_30d",
@@ -37,28 +115,99 @@ class IndividualBehaviorTool:
             "volatility_z",
             "daily_total",
             "daily_txn_count",
+            # если daily_percent есть — используем как ещё один признак
             "daily_percent",
-            "days_since_last_txn",
+            "log_days_since_last",
+            "rel_amount_to_mean30d",
         ]
-        model = IsolationForest(
-            n_estimators=300,
-            max_samples="auto",
-            contamination=self.contamination,
-            random_state=self.random_state,
+
+        # гарантируем наличие всех колонок (если чего-то нет — забиваем нулями)
+        for c in feature_cols:
+            if c not in tbl.columns:
+                tbl[c] = 0.0
+
+        # приводим к float и убираем NaN/inf
+        X = (
+            tbl[feature_cols]
+            .replace([np.inf, -np.inf], 0.0)
+            .fillna(0.0)
+            .astype(float)
         )
-        model.fit(table[feature_cols])
-        raw_score = -model.decision_function(table[feature_cols])
-        normalized = (raw_score - raw_score.min()) / (raw_score.max() - raw_score.min() + 1e-6)
-        return pd.Series(normalized, index=table.index)
+        tbl[feature_cols] = X
 
-    def run(self, debit_table: pd.DataFrame, credit_table: pd.DataFrame) -> IndividualBehaviorResult:
-        debit_score = self._fit_side(debit_table)
-        credit_score = self._fit_side(credit_table)
+        return tbl, feature_cols
 
-        scores = pd.DataFrame({
-            "txn_id": debit_table["txn_id"],
-            "iforest_score_debit": debit_score,
-            "iforest_score_credit": credit_score,
-        })
-        scores["behavior_score"] = scores[["iforest_score_debit", "iforest_score_credit"]].max(axis=1)
+    def _fit_side(self, table: pd.DataFrame, side: str) -> pd.Series:
+        """
+        Обучаем отдельный IsolationForest на КАЖДЫЙ ИНН внутри одной роли
+        (debit / credit), как в ноутбуке.
+        Возвращаем pd.Series с индексом table.index и значениями [0,1].
+        """
+        if "inn" not in table.columns:
+            raise ValueError(f"IndividualBehaviorTool: expected 'inn' column for side={side}.")
+
+        tbl, feature_cols = self._prepare_side_features(table)
+
+        # итоговый скор по всем строкам данной роли
+        scores = pd.Series(index=tbl.index, dtype=float, name=f"iforest_score_{side}")
+
+        # проходим по каждому ИНН
+        for inn, sub in tbl.groupby("inn"):
+            n = len(sub)
+            if n < self.min_tx_per_inn:
+                continue  # мало транзакций — не учим модель, скор остаётся NaN
+
+            X = sub[feature_cols].values
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X)
+
+            cont = self._adaptive_contamination(n)
+            model = IsolationForest(
+                n_estimators=300,
+                max_samples="auto",
+                contamination=cont,
+                random_state=self.random_state,
+                bootstrap=False,
+                n_jobs=-1,
+            )
+            model.fit(Xs)
+
+            # score_samples: чем ниже, тем более аномально → берём -score
+            raw = -model.score_samples(Xs)  # положительное выше = аномальнее
+            # нормировка внутри ИНН в [0,1]
+            s_norm = (raw - raw.min()) / (raw.max() - raw.min() + 1e-9)
+
+            scores.loc[sub.index] = s_norm
+
+        return scores
+
+    # ----------------------- PUBLIC API -----------------------
+
+    def run(
+        self,
+        debit_table: pd.DataFrame,
+        credit_table: pd.DataFrame,
+    ) -> IndividualBehaviorResult:
+        """
+        Ожидается, что debit_table и credit_table получены из FeatureEngineer._split_roles
+        и содержат одинаковый порядок txn_id (по одной строке на роль на каждую операцию).
+        """
+        # отдельные скоринги по ролям
+        debit_score = self._fit_side(debit_table, side="debit")
+        credit_score = self._fit_side(credit_table, side="credit")
+
+        # собираем в один df по txn_id (как и раньше)
+        scores = pd.DataFrame(
+            {
+                "txn_id": debit_table["txn_id"].astype(str),
+                "iforest_score_debit": debit_score.values,
+                "iforest_score_credit": credit_score.values,
+            }
+        )
+
+        # единый индивидуальный скор как максимум по ролям
+        scores["behavior_score"] = scores[
+            ["iforest_score_debit", "iforest_score_credit"]
+        ].max(axis=1)
+
         return IndividualBehaviorResult(scores=scores)
