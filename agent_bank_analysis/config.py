@@ -4,7 +4,8 @@ Configuration constants for the transaction risk agent.
 from pathlib import Path
 
 DATA_DIR = Path("data")
-DEFAULT_INPUT_PATTERN = "*.csv"
+# Default input patterns support both CSV and Excel bank statements.
+DEFAULT_INPUT_PATTERNS = ("*.csv", "*.xlsx", "*.xls")
 DEFAULT_OUTPUT_EXCEL = Path("llm_scored_transactions.xlsx")
 
 # Columns that should be present; missing ones are created with zeros during preprocessing

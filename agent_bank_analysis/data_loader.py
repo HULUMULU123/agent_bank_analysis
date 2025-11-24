@@ -1,13 +1,25 @@
 """Data loading helpers for the transaction analysis agent."""
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Union
 
 import pandas as pd
 
-from .config import DATA_DIR, DEFAULT_INPUT_PATTERN
+from .config import DATA_DIR, DEFAULT_INPUT_PATTERNS
+
+InputPattern = Union[str, Iterable[str]]
 
 
-def discover_statement(path: Optional[Path] = None, pattern: str = DEFAULT_INPUT_PATTERN) -> Path:
+def _normalize_patterns(pattern: Optional[InputPattern]) -> Iterable[str]:
+    if pattern is None:
+        return DEFAULT_INPUT_PATTERNS
+    if isinstance(pattern, str):
+        return (pattern,)
+    return tuple(pattern)
+
+
+def discover_statement(
+    path: Optional[Path] = None, pattern: Optional[InputPattern] = DEFAULT_INPUT_PATTERNS
+) -> Path:
     """Return the first statement file matching the pattern.
 
     The notebook previously read a specific CSV from the ``data`` directory.
@@ -18,15 +30,22 @@ def discover_statement(path: Optional[Path] = None, pattern: str = DEFAULT_INPUT
     if base_dir.is_file():
         return base_dir
 
-    matches = sorted(base_dir.glob(pattern))
+    patterns = _normalize_patterns(pattern)
+    matches = []
+    for patt in patterns:
+        matches.extend(base_dir.glob(patt))
+
+    matches = sorted(set(matches))
     if not matches:
         raise FileNotFoundError(
-            f"No files matching {pattern} found under {base_dir.resolve()}"
+            f"No files matching {patterns} found under {base_dir.resolve()}"
         )
     return matches[0]
 
 
-def load_statement(path: Optional[Path] = None, pattern: str = DEFAULT_INPUT_PATTERN) -> pd.DataFrame:
+def load_statement(
+    path: Optional[Path] = None, pattern: Optional[InputPattern] = DEFAULT_INPUT_PATTERNS
+) -> pd.DataFrame:
     """Load a bank statement into a pandas ``DataFrame``.
 
     The loader supports both CSV and Excel files and preserves the original
