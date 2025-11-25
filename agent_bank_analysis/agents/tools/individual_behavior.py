@@ -21,8 +21,7 @@ class IndividualBehaviorTool:
 
     Логика приближена к ноутбуку:
     - отдельная модель IsolationForest для КАЖДОГО ИНН и КАЖДОЙ роли (debit/credit);
-    - набор расширенных фич (amount, roll_* , spikes, текст и т.п. — в пределах того,
-      что есть в debit_table/credit_table от FeatureEngineer._split_roles);
+    - набор расширенных фич (как в ноутбуке: amount, roll_*, spikes, текст, календарь, глобальные фичи и т.п.);
     - адаптивный contamination по количеству транзакций по ИНН;
     - нормировка score внутри ИНН в [0, 1];
     - для транзакции общий behavior_score = max(iforest_score_debit, iforest_score_credit).
@@ -60,45 +59,59 @@ class IndividualBehaviorTool:
         target = min(target, max_anom / n_samples)
         return float(np.clip(target, self.min_contamination, self.max_contamination))
 
-    def _prepare_side_features(self, table: pd.DataFrame) -> pd.DataFrame:
+    def _prepare_side_features(self, table: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         """
-        Приводим таблицу роли (debit/credit) к формату, близкому к ноутбуку:
-        - добавляем log_days_since_last;
-        - считаем rel_amount_to_mean30d;
-        - заполняем отсутствующие фичи нулями.
-        Ожидается, что table получен из FeatureEngineer._split_roles.
+        Приводим таблицу роли (debit/credit) к формату, максимально близкому к ноутбуку.
+
+        - добавляем при необходимости log_amount;
+        - считаем log_days_since_last (если нет);
+        - считаем rel_amount_to_mean30d (если нет);
+        - гарантируем наличие всех фич из ноутбука, заполняя отсутствующие нулями.
+
+        Ожидается, что table получен из FeatureEngineer._split_roles
+        и уже содержит дебетовые/кредитовые признаки.
         """
         tbl = table.copy()
 
-        # базовые колонки из FeatureEngineer._split_roles
-        # (txn_id, date, inn, side, purpose, amount, log_amount, …)
+        # amount / log_amount
         if "amount" not in tbl.columns:
-            # на всякий случай восстанавливаем из log_amount, если нужно
             if "log_amount" in tbl.columns:
                 tbl["amount"] = np.expm1(tbl["log_amount"]).clip(lower=0)
             else:
                 tbl["amount"] = 0.0
 
-        # лог-интервал между операциями
-        if "days_since_last_txn" in tbl.columns:
-            tbl["log_days_since_last"] = np.log1p(
-                tbl["days_since_last_txn"].astype(float)
-            )
-        else:
-            tbl["log_days_since_last"] = 0.0
+        if "log_amount" not in tbl.columns:
+            tbl["log_amount"] = np.log1p(tbl["amount"].astype(float).clip(lower=0))
+
+        # log_days_since_last
+        if "log_days_since_last" not in tbl.columns:
+            if "days_since_last_txn" in tbl.columns:
+                tbl["log_days_since_last"] = np.log1p(
+                    tbl["days_since_last_txn"].astype(float)
+                )
+            else:
+                tbl["log_days_since_last"] = 0.0
 
         # относительная сумма к среднему за 30 дней
-        if "roll_mean_30d" in tbl.columns:
-            rel = tbl["amount"].astype(float) / (
-                tbl["roll_mean_30d"].replace(0, np.nan) + 1e-6
-            )
-            tbl["rel_amount_to_mean30d"] = (
-                rel.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            )
-        else:
-            tbl["rel_amount_to_mean30d"] = 0.0
+        if "rel_amount_to_mean30d" not in tbl.columns:
+            if "roll_mean_30d" in tbl.columns:
+                rel = tbl["amount"].astype(float) / (
+                    tbl["roll_mean_30d"].replace(0, np.nan) + 1e-6
+                )
+                tbl["rel_amount_to_mean30d"] = (
+                    rel.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
+            else:
+                tbl["rel_amount_to_mean30d"] = 0.0
 
-        # фичи, максимально приближённые к ноутбуку, но из того, что реально есть
+        # daily_txn_cnt: приводим к имени из ноутбука
+        if "daily_txn_cnt" not in tbl.columns:
+            if "daily_txn_count" in tbl.columns:
+                tbl["daily_txn_cnt"] = tbl["daily_txn_count"].astype(float)
+            else:
+                tbl["daily_txn_cnt"] = 0.0
+
+        # фичи как в ноутбуке (feat_cols)
         feature_cols = [
             "amount",
             "log_amount",
@@ -114,9 +127,19 @@ class IndividualBehaviorTool:
             "fan_ratio",
             "volatility_z",
             "daily_total",
-            "daily_txn_count",
-            # если daily_percent есть — используем как ещё один признак
-            "daily_percent",
+            "daily_txn_cnt",
+            "in_out_ratio_30d",
+            "net_flow_ratio_7d",
+            "transit_same_day_flag",
+            "round_large_amount",
+            "client_round_ratio_30d",
+            "purpose_len",
+            "purpose_digits_ratio",
+            "purpose_upper_ratio",
+            "is_weekend",
+            "is_month_end",
+            "is_quarter_end",
+            "is_year_end",
             "log_days_since_last",
             "rel_amount_to_mean30d",
         ]
@@ -196,7 +219,7 @@ class IndividualBehaviorTool:
         debit_score = self._fit_side(debit_table, side="debit")
         credit_score = self._fit_side(credit_table, side="credit")
 
-        # собираем в один df по txn_id (как и раньше)
+        # собираем в один df по txn_id
         scores = pd.DataFrame(
             {
                 "txn_id": debit_table["txn_id"].astype(str),
